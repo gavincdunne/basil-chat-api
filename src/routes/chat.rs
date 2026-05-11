@@ -33,6 +33,13 @@ use crate::{
     state::AppState,
 };
 
+/// Maximum number of messages accepted in a single request.
+///
+/// Limits the volume of PHI that can be sent to the AI backend in one call
+/// and keeps per-request Anthropic costs predictable. Conversations longer
+/// than this should be truncated by the client before sending.
+const MAX_MESSAGES: usize = 40;
+
 /// Request body for `POST /chat`.
 #[derive(Deserialize)]
 pub struct ChatRequest {
@@ -52,6 +59,16 @@ pub async fn chat(
     let token = bearer_token(&headers).ok_or(AppError::Unauthorized)?;
     if token != state.api_key {
         return Err(AppError::Unauthorized);
+    }
+
+    // Reject oversized conversation histories. This enforces the minimum
+    // necessary principle — clients should not be sending the full lifetime
+    // conversation history on every request.
+    if body.messages.len() > MAX_MESSAGES {
+        return Err(AppError::BadRequest(format!(
+            "message count {} exceeds maximum of {MAX_MESSAGES}",
+            body.messages.len()
+        )));
     }
 
     let stream = state.client.stream_chat(body.messages).await?;
@@ -137,6 +154,17 @@ mod tests {
         r#"{"messages":[{"role":"user","content":"What is a normal BG range?"}]}"#
     }
 
+    /// Builds a JSON body with exactly `count` alternating user/assistant messages.
+    fn chat_body_with_messages(count: usize) -> String {
+        let messages: Vec<String> = (0..count)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                format!(r#"{{"role":"{role}","content":"message {i}"}}"#)
+            })
+            .collect();
+        format!(r#"{{"messages":[{}]}}"#, messages.join(","))
+    }
+
     #[tokio::test]
     async fn missing_auth_header_returns_401() {
         let response = test_app()
@@ -186,6 +214,40 @@ mod tests {
             response.headers().get("content-type").unwrap(),
             "text/event-stream"
         );
+    }
+
+    #[tokio::test]
+    async fn message_count_at_limit_returns_200() {
+        let body = chat_body_with_messages(MAX_MESSAGES);
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST").uri("/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn message_count_over_limit_returns_422() {
+        let body = chat_body_with_messages(MAX_MESSAGES + 1);
+        let response = test_app()
+            .oneshot(
+                Request::builder()
+                    .method("POST").uri("/chat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-key")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
